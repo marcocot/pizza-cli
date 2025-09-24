@@ -7,6 +7,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 concurrency:
   group: release-${{ github.workflow }}-${{ github.ref }}
@@ -44,16 +45,16 @@ jobs:
     steps:
       - name: Release Please
         id: release
-        uses: google-github-actions/release-please-action@v4
+        uses: googleapis/release-please-action@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PAT }}
           config-file: .release-please-config.json
           manifest-file: .github/release-please-manifest.json
 
   build-and-upload:
     name: Build & Upload Binaries
     needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    if: needs.release-please.outputs.prs_created == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -62,8 +63,14 @@ jobs:
             target: x86_64-unknown-linux-gnu
             ext: ""
             archive: tar.gz
-          - os: macos-latest
+          # macOS Intel
+          - os: macos-13
             target: x86_64-apple-darwin
+            ext: ""
+            archive: tar.gz
+          # macOS Apple Silicon
+          - os: macos-14
+            target: aarch64-apple-darwin
             ext: ""
             archive: tar.gz
           - os: windows-latest
@@ -72,48 +79,80 @@ jobs:
             archive: zip
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
 
-      - name: Install Rust (stable)
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build (pizza-cli)
-        working-directory: pizza-cli
+      - name: Build (release)
         run: |
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --workspace --release --target ${{ matrix.target }}
 
-      - name: Package artifact
+      - name: Archive binaries
+        run: |
+          APP_NAME=pizza-cli
+          BIN_PATH=target/${{ matrix.target }}/release/${APP_NAME}${{ matrix.ext }}
+          mkdir -p dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            cd target/${{ matrix.target }}/release
+            zip -r "${{ github.ref_name }}-${{ matrix.target }}.zip" "${APP_NAME}${{ matrix.ext }}"
+            mv "${{ github.ref_name }}-${{ matrix.target }}.zip" ../../../dist/
+          else
+            tar -czf "dist/${{ github.ref_name }}-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" "${APP_NAME}${{ matrix.ext }}"
+          fi
+
+      - name: Upload assets to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ steps.release.outputs.tag_name }}" dist/* --clobber
+
+  homebrew-tap:
+    name: Update Homebrew Tap
+    runs-on: ubuntu-latest
+    needs: build-and-upload
+    steps:
+      - name: Checkout tap repo
+        uses: actions/checkout@v5
+        with:
+          repository: marcocot/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+          fetch-depth: 0
+
+      - name: Checkout main repo
+        uses: actions/checkout@v5
+        with:
+          path: mainrepo
+          fetch-depth: 0
+
+      - name: Prepare formula
         shell: bash
         run: |
           set -euo pipefail
-          BIN_NAME="pizza-cli${{ matrix.ext }}"
-          TAG="${{ needs.release-please.outputs.tag_name }}"
-          OUT_DIR="dist"
-          mkdir -p "$OUT_DIR"
+          FORMULA_PATH="tap/Formula/pizza-cli.rb"
+          cp mainrepo/.github/Formula/pizza-cli.rb.in "$FORMULA_PATH"
 
-          BIN_PATH="target/${{ matrix.target }}/release/${BIN_NAME}"
+          sed -i "s|TAG|${TAG}|g" "$FORMULA_PATH"
+          CLEAN_VER="${TAG#v}"
+          sed -i "s|version \"0.0.0\"|version \"${CLEAN_VER}\"|g" "$FORMULA_PATH"
+          sed -i "s|X64_SHA|${X64_SHA}|g" "$FORMULA_PATH"
+          sed -i "s|ARM_SHA|${ARM_SHA}|g" "$FORMULA_PATH"
 
-          # Compose archive name
-          ARCHIVE="pizza-cli-${TAG}-${{ matrix.target }}.${{ matrix.archive }}"
-
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            7z a "$OUT_DIR/$ARCHIVE" "$BIN_PATH"
-          else
-            tar -C "target/${{ matrix.target }}/release" -czf "$OUT_DIR/$ARCHIVE" "$BIN_NAME"
-          fi
-
-          echo "ARCHIVE_PATH=$OUT_DIR/$ARCHIVE" >> $GITHUB_ENV
-
-      - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.release-please.outputs.tag_name }}
-          files: ${{ env.ARCHIVE_PATH }}
+      - name: Commit & push tap
+        working-directory: tap
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/pizza-cli.rb
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "pizza-cli: bump to ${TAG}"
+            git push
+          fi
