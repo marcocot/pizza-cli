@@ -1,28 +1,32 @@
-name: Release Pipeline
+name: CI & Release
 
 on:
   push:
     branches: [ master ]
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
-  pull-requests: write
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test-and-lint:
-    name: Test & Lint (Clippy)
+  ci_master:
+    name: Lint & Test (master)
+    if: startsWith(github.ref, 'refs/heads/master')
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
 
-      - name: Cache
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -30,26 +34,36 @@ jobs:
       - name: Tests
         run: cargo test --workspace --all-features --all
 
-  release-please:
-    name: Release Please (Conventional Commits)
+  
+  prepare_release:
+    name: Prepare Release (on tag)
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
-    needs: test-and-lint
     outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
+      tag: ${{ steps.meta.outputs.tag }}
     steps:
-      - name: Release Please
-        id: release
-        uses: google-github-actions/release-please-action@v4
+      - uses: actions/checkout@v5
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          config-file: .release-please-config.json
-          manifest-file: .github/release-please-manifest.json
+          fetch-depth: 0
 
-  build-and-upload:
-    name: Build & Upload Binaries
-    needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+      - name: Extract tag
+        id: meta
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure GitHub Release exists
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --generate-notes
+
+  build_and_upload:
+    name: Build & Upload assets
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: prepare_release
     strategy:
       fail-fast: false
       matrix:
@@ -58,8 +72,12 @@ jobs:
             target: x86_64-unknown-linux-gnu
             ext: ""
             archive: tar.gz
-          - os: macos-latest
+          - os: macos-13        # macOS Intel
             target: x86_64-apple-darwin
+            ext: ""
+            archive: tar.gz
+          - os: macos-14        # macOS Apple Silicon
+            target: aarch64-apple-darwin
             ext: ""
             archive: tar.gz
           - os: windows-latest
@@ -67,49 +85,122 @@ jobs:
             ext: ".exe"
             archive: zip
     runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ needs.prepare_release.outputs.tag }}
+      APP_NAME: pizza-cli
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Install Rust (stable)
+      - name: Install Rust (target)
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache
-        uses: Swatinem/rust-cache@v2
+      - name: Build release
+        run: cargo build --workspace --release --target ${{ matrix.target }}
 
-      - name: Build (pizza-cli)
-        working-directory: pizza-cli
-        run: |
-          cargo build --release --target ${{ matrix.target }}
-
-      - name: Package artifact
+      - name: Package
         shell: bash
         run: |
           set -euo pipefail
-          BIN_NAME="pizza-cli${{ matrix.ext }}"
-          TAG="${{ needs.release-please.outputs.tag_name }}"
-          OUT_DIR="dist"
-          mkdir -p "$OUT_DIR"
-
-          BIN_PATH="target/${{ matrix.target }}/release/${BIN_NAME}"
-
-          # Compose archive name
-          ARCHIVE="pizza-cli-${TAG}-${{ matrix.target }}.${{ matrix.archive }}"
-
+          mkdir -p dist
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            7z a "$OUT_DIR/$ARCHIVE" "$BIN_PATH"
+            (cd "target/${{ matrix.target }}/release" && zip -r "${TAG}-${{ matrix.target }}.zip" "${APP_NAME}${{ matrix.ext }}")
+            mv "target/${{ matrix.target }}/release/${TAG}-${{ matrix.target }}.zip" dist/
           else
-            tar -C "target/${{ matrix.target }}/release" -czf "$OUT_DIR/$ARCHIVE" "$BIN_NAME"
+            tar -czf "dist/${TAG}-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" "${APP_NAME}${{ matrix.ext }}"
           fi
 
-          echo "ARCHIVE_PATH=$OUT_DIR/$ARCHIVE" >> $GITHUB_ENV
-
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.release-please.outputs.tag_name }}
-          files: ${{ env.ARCHIVE_PATH }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$TAG" dist/* --clobber
+
+  changelog:
+    name: Generate & Commit CHANGELOG.md
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [prepare_release, build_and_upload]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: master 
+
+      - name: Install github_changelog_generator
+        run: sudo gem install github_changelog_generator
+
+      - name: Generate CHANGELOG.md
+        env:
+          CHANGELOG_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ORG="${GITHUB_REPOSITORY%/*}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          github_changelog_generator --user "$ORG" --project "$REPO" --token "$CHANGELOG_GITHUB_TOKEN" --output CHANGELOG.md
+
+      - name: Commit & push CHANGELOG.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git diff --cached --quiet || git commit -m "chore: update CHANGELOG.md for ${{ needs.prepare_release.outputs.tag }}"
+          git push
+
+  homebrew_tap:
+    name: Update Private Homebrew Tap
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [prepare_release, build_and_upload]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.prepare_release.outputs.tag }}
+    steps:
+      - name: Checkout tap repo
+        uses: actions/checkout@v5
+        with:
+          repository: marcocot/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+          fetch-depth: 0
+
+      - name: Download macOS assets from release
+        working-directory: tap
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${TAG}" \
+            --pattern "${TAG}-aarch64-apple-darwin.tar.gz" \
+            --pattern "${TAG}-x86_64-apple-darwin.tar.gz" \
+            --repo "${GITHUB_REPOSITORY}"
+
+      - name: Compute SHAs
+        id: shas
+        working-directory: tap
+        run: |
+          echo "arm=$(sha256sum ${TAG}-aarch64-apple-darwin.tar.gz | awk '{print $1}')" >> $GITHUB_OUTPUT
+          echo "x64=$(sha256sum ${TAG}-x86_64-apple-darwin.tar.gz | awk '{print $1}')" >> $GITHUB_OUTPUT
+
+      - name: Prepare formula from template
+        run: |
+          set -euo pipefail
+          CLEAN_VER="${TAG#v}"
+          mkdir -p tap/Formula
+          # Il template deve stare in questo repo principale
+          cp .github/Formula/pizza-cli.rb.in tap/Formula/pizza-cli.rb
+          sed -i "s|VERSION_HERE|${CLEAN_VER}|g" tap/Formula/pizza-cli.rb
+          sed -i "s|TAG_HERE|${TAG}|g" tap/Formula/pizza-cli.rb
+          sed -i "s|X64_SHA_HERE|${{ steps.shas.outputs.x64 }}|g" tap/Formula/pizza-cli.rb
+          sed -i "s|ARM_SHA_HERE|${{ steps.shas.outputs.arm }}|g" tap/Formula/pizza-cli.rb
+
+      - name: Commit & push to tap
+        working-directory: tap
+        env:
+          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/pizza-cli.rb
+          git diff --cached --quiet || git commit -m "pizza-cli: ${TAG}"
+          git push
