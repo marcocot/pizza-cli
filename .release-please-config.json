@@ -1,5 +1,6 @@
 {
   "release-type": "manifest",
+  "bootstrap-sha": "2e38d4d96b8ad2e295e20ac7a7dce482c0fc58b9",
   "include-component-in-tag": true,
   "packages": {
     "pizza-core": {

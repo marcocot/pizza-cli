@@ -63,8 +63,14 @@ jobs:
             target: x86_64-unknown-linux-gnu
             ext: ""
             archive: tar.gz
-          - os: macos-latest
+          # macOS Intel
+          - os: macos-13
             target: x86_64-apple-darwin
+            ext: ""
+            archive: tar.gz
+          # macOS Apple Silicon
+          - os: macos-14
+            target: aarch64-apple-darwin
             ext: ""
             archive: tar.gz
           - os: windows-latest
@@ -118,3 +124,51 @@ jobs:
           files: ${{ env.ARCHIVE_PATH }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  homebrew-tap:
+    name: Update Homebrew Tap
+    runs-on: ubuntu-latest
+    needs: build-and-upload
+    steps:
+      - name: Checkout tap repo
+        uses: actions/checkout@v5
+        with:
+          repository: marcocot/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+          fetch-depth: 0
+
+      - name: Checkout main repo
+        uses: actions/checkout@v5
+        with:
+          path: mainrepo
+          fetch-depth: 0
+
+      - name: Prepare formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          FORMULA_PATH="tap/Formula/pizza-cli.rb"
+          cp mainrepo/.github/Formula/pizza-cli.rb.in "$FORMULA_PATH"
+
+          sed -i "s|TAG|${TAG}|g" "$FORMULA_PATH"
+          CLEAN_VER="${TAG#v}"
+          sed -i "s|version \"0.0.0\"|version \"${CLEAN_VER}\"|g" "$FORMULA_PATH"
+          sed -i "s|X64_SHA|${X64_SHA}|g" "$FORMULA_PATH"
+          sed -i "s|ARM_SHA|${ARM_SHA}|g" "$FORMULA_PATH"
+
+      - name: Commit & push tap
+        working-directory: tap
+        env:
+          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/pizza-cli.rb
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "pizza-cli: bump to ${TAG}"
+            git push
+          fi

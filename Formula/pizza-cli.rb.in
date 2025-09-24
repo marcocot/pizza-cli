@@ -1,0 +1,24 @@
+class PizzaCli < Formula
+  desc "Command-line tool to calculate pizza dough ingredients and fermentation timelines"
+  homepage "https://github.com/marcocot/pizza-cli"
+  version "0.0.0" # replaced below
+
+  on_macos do
+    on_intel do
+      url "https://github.com/marcocot/pizza-cli/releases/download/TAG/pizza-cli-TAG-x86_64-apple-darwin.tar.gz"
+      sha256 "X64_SHA"
+    end
+    on_arm do
+      url "https://github.com/marcocot/pizza-cli/releases/download/TAG/pizza-cli-TAG-aarch64-apple-darwin.tar.gz"
+      sha256 "ARM_SHA"
+    end
+  end
+
+  def install
+    bin.install "pizza-cli"
+  end
+
+  test do
+    system "#{bin}/pizza-cli", "--help"
+  end
+end
