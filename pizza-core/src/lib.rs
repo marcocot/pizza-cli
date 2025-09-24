@@ -193,8 +193,8 @@ mod tests {
     fn test_yeast_percent_bounds() {
         let p_lo = estimate_yeast_percent_dry(35.0, 260, 24.0);
         let p_hi = estimate_yeast_percent_dry(10.0, 450, 6.0);
-        assert!(p_lo >= 0.0005 && p_lo <= 0.015);
-        assert!(p_hi >= 0.0005 && p_hi <= 0.015);
+        (0.0005..=0.015).contains(&p_lo);
+        (0.0005..=0.015).contains(&p_hi);
     }
 
     #[test]
