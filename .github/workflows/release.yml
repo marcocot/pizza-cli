@@ -19,7 +19,7 @@ jobs:
     if: startsWith(github.ref, 'refs/heads/master')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -42,7 +42,7 @@ jobs:
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -85,7 +85,7 @@ jobs:
       TAG: ${{ needs.prepare_release.outputs.tag }}
       APP_NAME: pizza-cli
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install Rust (target)
         uses: dtolnay/rust-toolchain@stable
@@ -118,7 +118,7 @@ jobs:
     needs: [prepare_release, build_and_upload]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           ref: master 
@@ -134,10 +134,10 @@ jobs:
     env:
       TAG: ${{ needs.prepare_release.outputs.tag }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
           
       - name: Checkout tap repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           repository: marcocot/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
