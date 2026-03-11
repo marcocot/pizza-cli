@@ -124,7 +124,7 @@ jobs:
           ref: master 
 
       - name: Install github_changelog_generator
-        uses: janheinrichmerker/action-github-changelog-generator@v2.3
+        uses: janheinrichmerker/action-github-changelog-generator@v2.4
 
   homebrew_tap:
     name: Update Private Homebrew Tap
