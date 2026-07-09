@@ -1,175 +1,97 @@
-# Pizza CLI & Core Library
+# pizza-cli
 
-A small Rust workspace for calculating pizza dough recipes and fermentation timelines.  
-This project started as a playful experiment and gradually became a reusable library (`pizza-core`) plus a command-line tool (`pizza-cli`).
+A little command-line tool that works out how much flour, water, salt and yeast
+go into a Neapolitan-style dough, and roughly when to start each step so the
+balls are ready when you want to bake.
 
-The goal is to provide bakers and hobbyists with a way to compute ingredient weights and timelines given flour strength, hydration, temperature, yeast type, and fermentation strategy (with or without fridge).
+It started as a way to stop me doing the same arithmetic on a napkin every
+Saturday. The numbers are heuristics, not gospel — treat them as a starting
+point and trust your dough over the table.
 
----
+The repo is a small Cargo workspace: `pizza-core` holds the math (and its
+tests), `pizza-cli` is the thing you actually run.
 
-## Table of Contents
+## Building
 
-- [Overview](#overview)
-- [How the calculations work](#how-the-calculations-work)
-  - [Ingredients math](#ingredients-math)
-  - [Yeast models](#yeast-models)
-  - [Effective fermentation hours](#effective-fermentation-hours)
-  - [Timelines](#timelines)
-- [Compiling and running](#compiling-and-running)
-  - [Requirements](#requirements)
-  - [Build](#build)
-  - [Run](#run)
-  - [Examples](#examples)
-- [Project structure](#project-structure)
-- [Contributing](#contributing)
-- [License](#license)
-
----
-
-## Overview
-
-The workspace has two crates:
-
-- **`pizza-core`**: a pure library with all the formulas, unit-tested.
-- **`pizza-cli`**: a command-line application that uses `pizza-core`, handles JSON profiles, pretty tables, and time-of-day calculations.
-
-The project is open source, built for fun, and intended for learning and experimentation.  
-Do not treat the output as professional baking advice: the numbers are heuristics and approximations.
-
----
-
-## How the calculations work
-
-### Ingredients math
-
-Given:
-- total dough weight = number of balls × weight per ball,
-- hydration as a fraction (e.g. 0.75 = 75%),
-- salt expressed in g/kg of flour,
-- yeast type and estimated percentage.
-
-The formulas are:
-
-- **Baker’s yeast (dry or fresh)**  
-  ```
-  flour = total_dough / (1 + hydration + salt% + yeast%)
-  water = flour × hydration
-  salt  = flour × salt%
-  yeast = flour × yeast%
-  ```
-
-### Yeast models
-
-- **Dry yeast baseline**: 0.35% of flour at 25 °C, W=260, 12h.  
-  Adjustments:
-  - Temperature: Q10 ≈ 2 per 10 °C difference.
-  - Flour strength (W): mild effect (exponent 0.2).
-  - Time: inversely proportional.
-
-- **Fresh yeast**: treated as ~3× dry yeast.
-
-### Effective fermentation hours
-
-Fridge fermentation is slower. We model this with a **fridge factor** (default 0.25):
-
-```
-effective_hours = (total_hours - fridge_hours) + fridge_hours × fridge_factor
-```
-
-So 4h in fridge counts like 1h at room temperature.
-
-### Timelines
-
-Two modes:
-
-- **No fridge**: total time split ~55% bulk, ~45% final proof, adjusted by temperature.
-- **With fridge**:  
-  ```
-  total = bulk + fridge + warmup + proof
-  ```
-  Remaining time (after fridge+warmup) is split ~35% bulk / ~65% proof, adjusted by temperature.
-
----
-
-## Compiling and running
-
-### Requirements
-
-- Rust toolchain (1.70+ recommended).  
-  Install via [rustup](https://rustup.rs).
-
-### Build
-
-Clone and build the workspace:
+You need a recent Rust toolchain — the crates are on the 2024 edition, so
+**1.85 or newer**. Get it from [rustup](https://rustup.rs) if you don't have it.
 
 ```bash
 git clone https://github.com/marcocot/pizza-cli.git
-cd pizza-workspace
+cd pizza-cli
 cargo build --release
 ```
 
-### Run
+The binary lands in `target/release/pizza-cli`.
 
-Run the CLI directly:
+## Running
+
+You have to give it the flour strength (`--w`); everything else has a sensible
+default. A plain same-day dough:
 
 ```bash
-cargo run -p pizza-cli -- --w 270 --temp 25 --yeast dry   --hydration 0.75 --ball-weight 280 --balls 2   --salt-per-kg 20 --total-hours 11 --start 09:00
+cargo run -p pizza-cli -- --w 270 --hydration 0.75 --balls 2 --total-hours 11 --start 09:00
 ```
 
-### Examples
+Cold-fermented in the fridge, fresh yeast:
 
-- **Dry yeast, no fridge**:
 ```bash
-cargo run -p pizza-cli -- --w 270 --temp 25 --yeast dry   --hydration 0.75 --ball-weight 280 --balls 2   --salt-per-kg 20 --total-hours 11 --start 09:00
+cargo run -p pizza-cli -- --w 270 --yeast fresh --hydration 0.70 \
+  --balls 4 --ball-weight 260 --salt-per-kg 22 \
+  --total-hours 24 --fridge-hours 16 --warmup-hours 3 --start 18:00
 ```
 
-- **Fresh yeast with fridge**:
+Timeline steps that spill past midnight are marked with `(+1d)`, so a 24-hour
+fridge plan doesn't quietly look like it finishes the same evening.
+
+`--help` lists every flag with its default. The defaults are dry yeast, 75%
+hydration, 20 g/kg salt, 280 g balls, 2 balls, 11 total hours, no fridge.
+
+### Profiles
+
+If you keep making the same dough, save the parameters and reload them later:
+
 ```bash
-cargo run -p pizza-cli -- --w 270 --temp 24 --yeast fresh   --hydration 0.70 --ball-weight 260 --balls 4   --salt-per-kg 22 --total-hours 24   --fridge-hours 16 --warmup-hours 3 --fridge-factor 0.25   --start 18:00
+# save
+cargo run -p pizza-cli -- --w 270 --hydration 0.75 --total-hours 12 \
+  --fridge-hours 4 --start 09:00 --save-profile torino.json
+
+# reload — the profile even carries --w, so you don't repeat it
+cargo run -p pizza-cli -- --profile torino.json --temp 24 --start 08:30
 ```
 
-- **Save a profile**:
-```bash
-cargo run -p pizza-cli -- --w 270 --temp 25 --yeast dry   --hydration 0.75 --ball-weight 280 --balls 2   --salt-per-kg 20 --total-hours 12   --fridge-hours 4 --warmup-hours 3 --start 09:00   --save-profile ./torino-caputo.json
-```
+Anything you pass on the command line overrides the profile; the profile
+overrides the built-in defaults.
 
-- **Load a profile**:
-```bash
-cargo run -p pizza-cli -- --profile ./torino-caputo.json --temp 24 --start 08:30
-```
+## How the numbers are worked out
 
----
+Ingredients are baker's math: total dough weight is `balls × ball-weight`, and
+flour is solved so `flour + water + salt + yeast` adds back up to that total.
+Water is `flour × hydration`, salt is the g/kg you asked for, yeast is an
+estimated percentage of the flour.
 
-## Project structure
+The yeast estimate is the interesting bit. It starts from ~0.35% dry yeast at
+25 °C, W=260, over 12 hours, then scales it:
 
-```
-pizza-workspace/
-├─ Cargo.toml          # workspace definition
-├─ pizza-core/         # library crate
-│  ├─ src/lib.rs       # all calculations and tests
-│  └─ Cargo.toml
-└─ pizza-cli/          # command-line interface
-   ├─ src/main.rs
-   └─ Cargo.toml
-```
+- temperature: Q10 ≈ 2, so every 10 °C roughly halves or doubles the amount;
+- flour strength: a mild pull (W to the power 0.2) — stronger flour, a touch
+  more yeast;
+- time: inversely, longer ferment needs less yeast.
 
----
+The result is clamped to a sane 0.05%–1.5%. Fresh yeast is just treated as ~3×
+dry. Fridge time counts as slower fermentation via a `--fridge-factor` (default
+0.25, i.e. four hours in the fridge ≈ one at room temperature), which feeds the
+"effective hours" the yeast math actually sees.
+
+The timeline splits the total into bulk and proof (and, with a fridge, the cold
+stretch plus a bench warm-up in between), nudging the bulk/proof balance a
+little with temperature.
 
 ## Contributing
 
-This is an open source project born almost as a toy. Contributions are welcome, whether to improve math models, extend yeast types, add new output formats, or clean up the code.
-
-### Guidelines
-- Fork the repository and create a branch for your feature or fix.
-- Add or update unit tests in `pizza-core` where applicable.
-- Ensure the project builds with `cargo build --release`.
-- Run tests with `cargo test`.
-- Submit a pull request with a clear description of the change.
-
-Even small improvements (docs, examples, formatting) are appreciated.
-
----
+Patches welcome — better models, more yeast types, nicer output, whatever. Keep
+`cargo test` green and run `cargo clippy` before opening a PR.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) file for details.
+MIT — see [LICENSE](LICENSE).

@@ -1,15 +1,31 @@
-use clap::{ArgGroup, Parser, ValueEnum};
-use chrono::{Local, NaiveTime, Timelike};
+use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+use clap::{Parser, ValueEnum};
 use comfy_table::{presets::UTF8_FULL, Attribute, Cell, ContentArrangement, Table};
 use pizza_core::{
-    compute_ingredients, effective_hours, timeline_no_fridge, timeline_with_fridge, IngredientsInput,
-    Timeline, YeastKind,
+    compute_ingredients, effective_hours, timeline_no_fridge, timeline_with_fridge,
+    IngredientsInput, Timeline, YeastKind,
 };
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, process::exit};
 
-/// Yeast CLI enum mirrors pizza-core (derive for Clap).
-#[derive(Copy, Clone, Debug, ValueEnum, Serialize, Deserialize)]
+// Defaults live here (not in clap's `default_value_t`) so we can tell an
+// explicit CLI value apart from an unset one: unset stays `None`, and the
+// resolution order becomes CLI > profile > default.
+const DEFAULT_TEMP: f64 = 25.0;
+const DEFAULT_YEAST: YeastFlag = YeastFlag::Dry;
+const DEFAULT_HYDRATION: f64 = 0.75;
+const DEFAULT_SALT_PER_KG: f64 = 20.0;
+const DEFAULT_BALL_WEIGHT: f64 = 280.0;
+const DEFAULT_BALLS: u32 = 2;
+const DEFAULT_TOTAL_HOURS: f64 = 11.0;
+const DEFAULT_FRIDGE_HOURS: f64 = 0.0;
+const DEFAULT_WARMUP_HOURS: f64 = 3.0;
+const DEFAULT_FRIDGE_FACTOR: f64 = 0.25;
+
+const W_MIN: u16 = 200;
+const W_MAX: u16 = 450;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum YeastFlag {
     Dry,
@@ -25,75 +41,75 @@ impl From<YeastFlag> for YeastKind {
     }
 }
 
-#[derive(Parser, Debug, Serialize, Deserialize)]
+/// Every parameter is optional so we can distinguish "given on the CLI" from
+/// "left to the profile or the default". `w` has no default: it must come from
+/// either the CLI or a profile.
+#[derive(Parser, Debug)]
 #[command(
-    name="pizza-cli",
-    about="Calculate ingredients & timeline for Neapolitan pizza (direct dough).",
+    name = "pizza-cli",
+    about = "Calculate ingredients & timeline for Neapolitan pizza (direct dough).",
     version
 )]
-#[command(group(
-    ArgGroup::new("time_group")
-        .args(["total_hours"])
-        .required(false)
-))]
 struct Args {
-    /// Flour strength W (e.g., 260–300)
-    #[arg(long, value_parser = clap::value_parser!(u16).range(200..=450))]
-    w: u16,
+    /// Flour strength W, 200–450 [required unless supplied by a profile]
+    #[arg(long, value_parser = clap::value_parser!(u16).range(W_MIN as i64..=W_MAX as i64))]
+    w: Option<u16>,
 
-    /// Ambient temperature in °C
-    #[arg(long, default_value_t = 25.0)]
-    temp: f64,
+    /// Ambient temperature in °C [default: 25]
+    #[arg(long)]
+    temp: Option<f64>,
 
-    /// Yeast type
-    #[arg(long, value_enum, default_value_t = YeastFlag::Dry)]
-    yeast: YeastFlag,
+    /// Yeast type [default: dry]
+    #[arg(long, value_enum)]
+    yeast: Option<YeastFlag>,
 
-    /// Target hydration (0.55..0.85)
-    #[arg(long, default_value_t = 0.75)]
-    hydration: f64,
+    /// Target hydration, 0.55–0.85 [default: 0.75]
+    #[arg(long)]
+    hydration: Option<f64>,
 
-    /// Salt in g/kg flour
-    #[arg(long, default_value_t = 20.0)]
-    salt_per_kg: f64,
+    /// Salt in g/kg flour [default: 20]
+    #[arg(long)]
+    salt_per_kg: Option<f64>,
 
-    /// Dough ball weight in grams
-    #[arg(long, default_value_t = 280.0)]
-    ball_weight: f64,
+    /// Dough ball weight in grams [default: 280]
+    #[arg(long)]
+    ball_weight: Option<f64>,
 
-    /// Number of balls
-    #[arg(long, default_value_t = 2)]
-    balls: u32,
+    /// Number of balls [default: 2]
+    #[arg(long)]
+    balls: Option<u32>,
 
-    /// Total process hours (mix → bake)
-    #[arg(long, default_value_t = 11.0)]
-    total_hours: f64,
+    /// Total process hours, mix → bake [default: 11]
+    #[arg(long)]
+    total_hours: Option<f64>,
 
-    /// Fridge time in hours (0 = no fridge mode)
-    #[arg(long, default_value_t = 0.0)]
-    fridge_hours: f64,
+    /// Fridge time in hours, 0 = no fridge [default: 0]
+    #[arg(long)]
+    fridge_hours: Option<f64>,
 
-    /// Warmup time after fridge (bench rest) in hours
-    #[arg(long, default_value_t = 3.0)]
-    warmup_hours: f64,
+    /// Bench rest after fridge, in hours [default: 3]
+    #[arg(long)]
+    warmup_hours: Option<f64>,
 
-    /// Fridge factor (activity speed vs room), default 0.25
-    #[arg(long, default_value_t = 0.25)]
-    fridge_factor: f64,
+    /// Fridge activity vs room, 0.05–0.5 [default: 0.25]
+    #[arg(long)]
+    fridge_factor: Option<f64>,
 
-    /// Start time HH:MM (optional); defaults to now
+    /// Start time HH:MM; defaults to now
     #[arg(long)]
     start: Option<String>,
 
-    /// Load a profile JSON before applying CLI overrides
+    /// Load a profile JSON, then apply CLI overrides on top
     #[arg(long)]
     profile: Option<PathBuf>,
 
-    /// Save the current effective parameters to a profile JSON
+    /// Save the effective parameters to a profile JSON
     #[arg(long)]
     save_profile: Option<PathBuf>,
 }
 
+/// A profile holds fully-resolved values: it is what we serialize on save and
+/// what we read back on load.
 #[derive(Debug, Serialize, Deserialize)]
 struct Profile {
     w: u16,
@@ -110,25 +126,6 @@ struct Profile {
     start: Option<String>,
 }
 
-impl From<&Args> for Profile {
-    fn from(a: &Args) -> Self {
-        Profile {
-            w: a.w,
-            temp: a.temp,
-            yeast: a.yeast,
-            hydration: a.hydration,
-            salt_per_kg: a.salt_per_kg,
-            ball_weight: a.ball_weight,
-            balls: a.balls,
-            total_hours: a.total_hours,
-            fridge_hours: a.fridge_hours,
-            warmup_hours: a.warmup_hours,
-            fridge_factor: a.fridge_factor,
-            start: a.start.clone(),
-        }
-    }
-}
-
 fn fmt_g(x: f64) -> String {
     let v = (x * 10.0).round() / 10.0;
     if (v - v.round()).abs() < 1e-9 {
@@ -138,145 +135,170 @@ fn fmt_g(x: f64) -> String {
     }
 }
 
+fn die(msg: impl std::fmt::Display) -> ! {
+    eprintln!("{msg}");
+    exit(1);
+}
+
+fn load_profile(path: &PathBuf) -> Profile {
+    let txt = fs::read_to_string(path)
+        .unwrap_or_else(|e| die(format!("Failed to read profile {}: {e}", path.display())));
+    serde_json::from_str(&txt)
+        .unwrap_or_else(|e| die(format!("Invalid profile JSON {}: {e}", path.display())))
+}
+
 fn main() {
-    let mut args = Args::parse();
+    let args = Args::parse();
 
-    // Load profile if present, then apply CLI overrides (CLI wins).
-    if let Some(path) = &args.profile {
-        let Ok(txt) = fs::read_to_string(path) else {
-            eprintln!("Failed to read profile: {}", path.display());
-            std::process::exit(1);
-        };
-        let Ok(p): Result<Profile, _> = serde_json::from_str(&txt) else {
-            eprintln!("Invalid profile JSON: {}", path.display());
-            std::process::exit(1);
-        };
+    let profile = args.profile.as_ref().map(load_profile);
+    let p = profile.as_ref();
 
-        // Defaults snapshot to detect "unset" fields
-        let def = Args::parse_from(["pizza-cli"]);
+    // Resolution order for every field: explicit CLI value, then profile, then
+    // the built-in default. `w` is the exception — it has no default.
+    let w = args
+        .w
+        .or(p.map(|p| p.w))
+        .unwrap_or_else(|| die("--w is required (pass it on the CLI or via a profile)"));
+    let temp = args.temp.or(p.map(|p| p.temp)).unwrap_or(DEFAULT_TEMP);
+    let yeast = args.yeast.or(p.map(|p| p.yeast)).unwrap_or(DEFAULT_YEAST);
+    let hydration = args
+        .hydration
+        .or(p.map(|p| p.hydration))
+        .unwrap_or(DEFAULT_HYDRATION);
+    let salt_per_kg = args
+        .salt_per_kg
+        .or(p.map(|p| p.salt_per_kg))
+        .unwrap_or(DEFAULT_SALT_PER_KG);
+    let ball_weight = args
+        .ball_weight
+        .or(p.map(|p| p.ball_weight))
+        .unwrap_or(DEFAULT_BALL_WEIGHT);
+    let balls = args.balls.or(p.map(|p| p.balls)).unwrap_or(DEFAULT_BALLS);
+    let total_hours = args
+        .total_hours
+        .or(p.map(|p| p.total_hours))
+        .unwrap_or(DEFAULT_TOTAL_HOURS);
+    let fridge_hours = args
+        .fridge_hours
+        .or(p.map(|p| p.fridge_hours))
+        .unwrap_or(DEFAULT_FRIDGE_HOURS);
+    let warmup_hours = args
+        .warmup_hours
+        .or(p.map(|p| p.warmup_hours))
+        .unwrap_or(DEFAULT_WARMUP_HOURS);
+    let fridge_factor = args
+        .fridge_factor
+        .or(p.map(|p| p.fridge_factor))
+        .unwrap_or(DEFAULT_FRIDGE_FACTOR);
+    let start = args.start.clone().or_else(|| p.and_then(|p| p.start.clone()));
 
-        macro_rules! take {
-            ($field:ident) => {
-                if args.$field == def.$field { p.$field } else { args.$field }
-            };
-        }
-
-        args.w = take!(w);
-        args.temp = take!(temp);
-        args.yeast = if matches!(args.yeast, YeastFlag::Dry) && !matches!(p.yeast, YeastFlag::Dry) {
-            p.yeast
-        } else {
-            args.yeast
-        };
-        args.hydration = take!(hydration);
-        args.salt_per_kg = take!(salt_per_kg);
-        args.ball_weight = take!(ball_weight);
-        args.balls = take!(balls);
-        args.total_hours = take!(total_hours);
-        args.fridge_hours = take!(fridge_hours);
-        args.warmup_hours = take!(warmup_hours);
-        args.fridge_factor = take!(fridge_factor);
-        if args.start.is_none() {
-            args.start = p.start;
-        }
+    // Validation. A profile can carry values that bypass clap's parsers, so we
+    // re-check everything here rather than trusting the source.
+    if !(W_MIN..=W_MAX).contains(&w) {
+        die(format!("W must be between {W_MIN} and {W_MAX}"));
+    }
+    if !(0.55..=0.85).contains(&hydration) {
+        die("Hydration must be between 0.55 and 0.85");
+    }
+    if total_hours <= 0.0 {
+        die("total-hours must be > 0");
+    }
+    if fridge_hours < 0.0 || warmup_hours < 0.0 {
+        die("fridge-hours and warmup-hours must be >= 0");
+    }
+    if fridge_hours > 0.0 && fridge_hours + warmup_hours >= total_hours {
+        die("Sum of fridge-hours and warmup-hours must be < total-hours");
     }
 
-    // Save profile if requested (using the effective arguments).
+    // Save once, only after everything is valid.
     if let Some(path) = &args.save_profile {
-        let prof = Profile::from(&args);
-        if let Err(e) = fs::write(path, serde_json::to_string_pretty(&prof).unwrap()) {
-            eprintln!("Failed to save profile: {e}");
-            std::process::exit(1);
-        } else {
-            println!("Profile saved to {}", path.display());
+        let prof = Profile {
+            w,
+            temp,
+            yeast,
+            hydration,
+            salt_per_kg,
+            ball_weight,
+            balls,
+            total_hours,
+            fridge_hours,
+            warmup_hours,
+            fridge_factor,
+            start: start.clone(),
+        };
+        let json = serde_json::to_string_pretty(&prof).expect("profile serializes");
+        if let Err(e) = fs::write(path, json) {
+            die(format!("Failed to save profile: {e}"));
         }
+        println!("Profile saved to {}", path.display());
     }
 
-    // Validations
-    if !(0.55..=0.85).contains(&args.hydration) {
-        eprintln!("Hydration must be between 0.55 and 0.85");
-        std::process::exit(1);
-    }
-    if args.total_hours <= 0.0 {
-        eprintln!("total-hours must be > 0");
-        std::process::exit(1);
-    }
-    if args.fridge_hours < 0.0 || args.warmup_hours < 0.0 {
-        eprintln!("fridge-hours and warmup-hours must be >= 0");
-        std::process::exit(1);
-    }
-    if args.fridge_hours > 0.0 && args.fridge_hours + args.warmup_hours >= args.total_hours {
-        eprintln!("Sum of fridge-hours and warmup-hours must be < total-hours");
-        std::process::exit(1);
-    }
+    let total_dough = balls as f64 * ball_weight;
+    let eff_hours = effective_hours(total_hours, fridge_hours, fridge_factor);
 
-    // Totals
-    let balls = args.balls as f64;
-    let total_dough = balls * args.ball_weight;
-
-    // Effective hours for yeast model
-    let eff_hours = effective_hours(args.total_hours, args.fridge_hours, args.fridge_factor);
-
-    // Ingredients
     let ing = compute_ingredients(IngredientsInput {
         total_dough_g: total_dough,
-        hydration: args.hydration,
-        salt_per_kg: args.salt_per_kg,
-        yeast: args.yeast.into(),
-        temp_c: args.temp,
-        w: args.w,
+        hydration,
+        salt_per_kg,
+        yeast: yeast.into(),
+        temp_c: temp,
+        w,
         effective_hours: eff_hours,
     });
 
-    // Timeline (with/without fridge)
-    let tl: Timeline = if args.fridge_hours > 0.0 {
-        timeline_with_fridge(args.total_hours, args.temp, args.fridge_hours, args.warmup_hours)
+    let tl: Timeline = if fridge_hours > 0.0 {
+        timeline_with_fridge(total_hours, temp, fridge_hours, warmup_hours)
     } else {
-        timeline_no_fridge(args.total_hours, args.temp)
+        timeline_no_fridge(total_hours, temp)
     };
 
-    // Start time and phase ends
-    let start_time = if let Some(hhmm) = args.start.as_ref() {
-        NaiveTime::parse_from_str(hhmm, "%H:%M").ok()
-    } else {
-        Some(Local::now().naive_local().time())
+    // Walk the phases forward from the start time, keeping full datetimes so we
+    // can flag phases that spill into the following day(s).
+    let start_time = match start.as_deref() {
+        Some(hhmm) => match NaiveTime::parse_from_str(hhmm, "%H:%M") {
+            Ok(t) => Some(t),
+            Err(_) => die(format!("Invalid --start time '{hhmm}', expected HH:MM")),
+        },
+        None => Some(Local::now().naive_local().time()),
     };
 
-    let (t_bulk_end, t_fridge_end, t_warmup_end, t_proof_end) = if let Some(st) = start_time {
-        let to_min = |h: f64| (h * 60.0).round() as i64;
-        let mut dt = Local::now().date_naive().and_time(st);
+    let (start_date, bulk_end, fridge_end, warmup_end, proof_end) = match start_time {
+        Some(st) => {
+            let to_min = |h: f64| (h * 60.0).round() as i64;
+            let start_dt = Local::now().date_naive().and_time(st);
+            let mut dt = start_dt;
 
-        let bulk_end = dt + chrono::Duration::minutes(to_min(tl.bulk_h));
-        dt = bulk_end;
+            dt += chrono::Duration::minutes(to_min(tl.bulk_h));
+            let bulk_end = Some(dt);
 
-        let fridge_end = if tl.fridge_h > 0.0 {
-            let e = dt + chrono::Duration::minutes(to_min(tl.fridge_h));
-            dt = e;
-            Some(e)
-        } else {
-            None
-        };
+            let fridge_end = if tl.fridge_h > 0.0 {
+                dt += chrono::Duration::minutes(to_min(tl.fridge_h));
+                Some(dt)
+            } else {
+                None
+            };
 
-        let warmup_end = if tl.warmup_h > 0.0 {
-            let e = dt + chrono::Duration::minutes(to_min(tl.warmup_h));
-            dt = e;
-            Some(e)
-        } else {
-            None
-        };
+            let warmup_end = if tl.warmup_h > 0.0 {
+                dt += chrono::Duration::minutes(to_min(tl.warmup_h));
+                Some(dt)
+            } else {
+                None
+            };
 
-        let proof_end = dt + chrono::Duration::minutes(to_min(tl.proof_h));
-        (
-            Some(bulk_end.time()),
-            fridge_end.map(|x| x.time()),
-            warmup_end.map(|x| x.time()),
-            Some(proof_end.time()),
-        )
-    } else {
-        (None, None, None, None)
+            dt += chrono::Duration::minutes(to_min(tl.proof_h));
+            let proof_end = Some(dt);
+
+            (
+                Some(start_dt.date()),
+                bulk_end,
+                fridge_end,
+                warmup_end,
+                proof_end,
+            )
+        }
+        None => (None, None, None, None, None),
     };
 
-    // Ingredients table
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL)
@@ -289,22 +311,26 @@ fn main() {
 
     table.add_row(vec![
         Cell::new("Balls"),
-        Cell::new(format!("{} × {:.0} g", args.balls, args.ball_weight)),
+        Cell::new(format!("{} × {:.0} g", balls, ball_weight)),
         Cell::new(""),
     ]);
     table.add_row(vec![
         Cell::new("Flour"),
         Cell::new(fmt_g(ing.flour_g)),
-        Cell::new(format!("W={} | H={:.0}%", args.w, args.hydration * 100.0)),
+        Cell::new(format!("W={} | H={:.0}%", w, hydration * 100.0)),
     ]);
-    table.add_row(vec![Cell::new("Water"), Cell::new(fmt_g(ing.water_g)), Cell::new("")]);
+    table.add_row(vec![
+        Cell::new("Water"),
+        Cell::new(fmt_g(ing.water_g)),
+        Cell::new(""),
+    ]);
     table.add_row(vec![
         Cell::new("Salt"),
         Cell::new(fmt_g(ing.salt_g)),
-        Cell::new(format!("{:.1} g/kg", args.salt_per_kg)),
+        Cell::new(format!("{:.1} g/kg", salt_per_kg)),
     ]);
 
-    match args.yeast {
+    match yeast {
         YeastFlag::Dry => table.add_row(vec![
             Cell::new("Dry yeast"),
             Cell::new(fmt_g(ing.yeast_g)),
@@ -318,45 +344,32 @@ fn main() {
     };
 
     println!("\n=== Ingredients summary ===");
-    println!("{}", table);
+    println!("{table}");
 
-    // Timeline
     println!("\n=== Timeline ===");
     println!(
         "- Bulk rise (whole dough): {:.1} h{}",
         tl.bulk_h,
-        match t_bulk_end {
-            Some(t) => format!(" → ~end at {:02}:{:02}", t.hour(), t.minute()),
-            None => "".to_string(),
-        }
+        fmt_end(start_date, bulk_end)
     );
 
     if tl.fridge_h > 0.0 {
         println!(
             "- Fridge (covered):        {:.1} h{}",
             tl.fridge_h,
-            match t_fridge_end {
-                Some(t) => format!(" → ~end at {:02}:{:02}", t.hour(), t.minute()),
-                None => "".to_string(),
-            }
+            fmt_end(start_date, fridge_end)
         );
         println!(
             "- Warmup (bench rest):     {:.1} h{}",
             tl.warmup_h,
-            match t_warmup_end {
-                Some(t) => format!(" → ~end at {:02}:{:02}", t.hour(), t.minute()),
-                None => "".to_string(),
-            }
+            fmt_end(start_date, warmup_end)
         );
     }
 
     println!(
         "- Final proof (balls):     {:.1} h{}",
         tl.proof_h,
-        match t_proof_end {
-            Some(t) => format!(" → ~end at {:02}:{:02}", t.hour(), t.minute()),
-            None => "".to_string(),
-        }
+        fmt_end(start_date, proof_end)
     );
 
     println!(
@@ -367,10 +380,20 @@ fn main() {
     println!("\nNotes:");
     println!("• Yeast amounts are heuristic (Q10≈2/10°C; mild W effect). Fridge counted at configurable factor.");
     println!("• If dough rises too fast in warm conditions (>27°C), shorten bulk or reduce yeast slightly.");
+}
 
-    // Save profile at the end if requested (again, to reflect any defaults resolved)
-    if let Some(path) = &args.save_profile {
-        let prof = Profile::from(&args);
-        let _ = fs::write(path, serde_json::to_string_pretty(&prof).unwrap());
+/// Format a phase end time, appending `(+Nd)` when it lands on a later day than
+/// the start so long fridge timelines aren't silently misread.
+fn fmt_end(start_date: Option<NaiveDate>, end: Option<NaiveDateTime>) -> String {
+    match (start_date, end) {
+        (Some(start), Some(dt)) => {
+            let days = (dt.date() - start).num_days();
+            if days > 0 {
+                format!(" → ~end at {:02}:{:02} (+{}d)", dt.hour(), dt.minute(), days)
+            } else {
+                format!(" → ~end at {:02}:{:02}", dt.hour(), dt.minute())
+            }
+        }
+        _ => String::new(),
     }
 }
