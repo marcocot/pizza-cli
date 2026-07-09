@@ -33,10 +33,7 @@ pub struct Ingredients {
     pub flour_g: f64,
     pub water_g: f64,
     pub salt_g: f64,
-    /// For baker’s yeast (dry/fresh).
     pub yeast_g: f64,
-    /// For sourdough only: total starter (flour+water) at 100% hydration.
-    pub starter_total_g: f64,
 }
 
 #[inline]
@@ -70,33 +67,25 @@ pub fn effective_hours(total_hours: f64, fridge_hours: f64, fridge_factor: f64) 
 }
 
 /// Compute ingredients for given input.
-/// - Dry/Fresh: dough = flour + water + salt + yeast
-/// - Sourdough: dough = flour + water + salt, where part of flour+water comes from starter (100%)
+/// Dough = flour + water + salt + yeast, solving for flour so the parts add
+/// up to the requested total dough weight.
 pub fn compute_ingredients(input: IngredientsInput) -> Ingredients {
     let salt_pct = input.salt_per_kg / 1000.0;
     let h = input.hydration;
 
-    match input.yeast {
-        YeastKind::Dry | YeastKind::Fresh => {
-            let dry_pct = estimate_yeast_percent_dry(input.temp_c, input.w, input.effective_hours);
-            let yeast_pct = match input.yeast {
-                YeastKind::Dry => dry_pct,
-                YeastKind::Fresh => dry_pct * 3.0,
-            };
+    let dry_pct = estimate_yeast_percent_dry(input.temp_c, input.w, input.effective_hours);
+    let yeast_pct = match input.yeast {
+        YeastKind::Dry => dry_pct,
+        YeastKind::Fresh => dry_pct * 3.0,
+    };
 
-            let flour = input.total_dough_g / (1.0 + h + salt_pct + yeast_pct);
-            let water = flour * h;
-            let salt = flour * salt_pct;
-            let yeast = flour * yeast_pct;
+    let flour = input.total_dough_g / (1.0 + h + salt_pct + yeast_pct);
 
-            Ingredients {
-                flour_g: flour,
-                water_g: water,
-                salt_g: salt,
-                yeast_g: yeast,
-                starter_total_g: 0.0,
-            }
-        }
+    Ingredients {
+        flour_g: flour,
+        water_g: flour * h,
+        salt_g: flour * salt_pct,
+        yeast_g: flour * yeast_pct,
     }
 }
 
@@ -191,10 +180,23 @@ mod tests {
 
     #[test]
     fn test_yeast_percent_bounds() {
+        // Hot + long time pushes the estimate down; cold + strong flour + short
+        // time pushes it up. Both must stay inside the clamp window.
         let p_lo = estimate_yeast_percent_dry(35.0, 260, 24.0);
         let p_hi = estimate_yeast_percent_dry(10.0, 450, 6.0);
-        (0.0005..=0.015).contains(&p_lo);
-        (0.0005..=0.015).contains(&p_hi);
+        assert!((0.0005..=0.015).contains(&p_lo), "p_lo out of bounds: {p_lo}");
+        assert!((0.0005..=0.015).contains(&p_hi), "p_hi out of bounds: {p_hi}");
+        assert!(p_lo < p_hi, "hotter/longer should need less yeast than colder/shorter");
+    }
+
+    #[test]
+    fn test_yeast_percent_clamps_extremes() {
+        // Extreme cold + short time would blow past 1.5% without the clamp.
+        let capped = estimate_yeast_percent_dry(0.0, 450, 1.0);
+        assert!((capped - 0.015).abs() < 1e-9, "expected upper clamp at 1.5%, got {capped}");
+        // Extreme heat + very long time would fall below 0.05% without the clamp.
+        let floored = estimate_yeast_percent_dry(45.0, 200, 72.0);
+        assert!((floored - 0.0005).abs() < 1e-9, "expected lower clamp at 0.05%, got {floored}");
     }
 
     #[test]
